@@ -1,16 +1,25 @@
 """Àránṣẹ́ Dashboard — CustomTkinter UI for scheduling LinkedIn posts."""
 
-from datetime import datetime
-
+import os
+import time
 import customtkinter as ctk
 from tkcalendar import Calendar
-
+from datetime import datetime
+from supabase import create_client, Client
 import db_manager
+
+# Load environment variables for Supabase Storage
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+supabase_client: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 db_manager.init_db()
 
-current_edit_id: int | None = None
-
+current_edit_id = None
 
 def to_unicode_bold(text: str) -> str:
     return "".join(chr(ord(c) - ord('A') + 0x1D5D4) if 'A' <= c <= 'Z' else chr(
@@ -153,6 +162,36 @@ def reset_form():
     schedule_btn.configure(text="Schedule Post")
     update_char_count()
 
+def upload_media_if_local(local_path: str) -> str:
+    """
+    Uploads a local file to Supabase Storage and returns its public HTTPS URL.
+    If the path is already a URL or empty, returns it as-is.
+    """
+    if not local_path or local_path.startswith("http://") or local_path.startswith("https://"):
+        return local_path
+
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(f"Selected media file not found: {local_path}")
+
+    if not supabase_client:
+        raise ValueError("Supabase storage client is not configured in .env")
+
+    bucket_name = "post-media"
+    file_ext = os.path.splitext(local_path)[1]
+    timestamp = int(time.time())
+    # Unique remote filename to avoid collisions
+    cloud_filename = f"media_{timestamp}{file_ext}"
+
+    with open(local_path, "rb") as f:
+        supabase_client.storage.from_(bucket_name).upload(
+            file=f,
+            path=cloud_filename,
+            file_options={"content-type": "auto"}
+        )
+
+    # Get the public HTTPS URL for the uploaded file
+    public_url = supabase_client.storage.from_(bucket_name).get_public_url(cloud_filename)
+    return public_url
 
 def queue_job(status_lbl: ctk.CTkLabel):
     global current_edit_id
@@ -161,40 +200,42 @@ def queue_job(status_lbl: ctk.CTkLabel):
     target_str = f"{date_entry.get().strip()} {time_entry.get().strip()}"
     img_path = image_path_var.get()
 
-    if not post_name:
-        status_lbl.configure(text="Error: Post Name cannot be empty.", text_color="red")
+    if not post_name or not content:
+        status_lbl.configure(text="Error: Post Name and Content are required.", text_color="red")
         return
-    if not content:
-        status_lbl.configure(text="Error: Content cannot be empty.", text_color="red")
-        return
+
     if len(content) > 3000:
         status_lbl.configure(text="Error: Content exceeds 3000 characters.", text_color="red")
         return
 
     try:
         target_dt = datetime.strptime(target_str, "%Y-%m-%d %H:%M")
-
-        # --- Time validation against past dates ---
         if target_dt < datetime.now():
-            status_lbl.configure(text="Error: You cannot schedule a post in the past.", text_color="red")
+            status_lbl.configure(text="Error: Cannot schedule posts in the past.", text_color="red")
             return
 
+        status_lbl.configure(text="Uploading media to cloud...", text_color="orange")
+        app.update()
+
+        # Upload local image to Supabase Storage if present
+        final_img_url = upload_media_if_local(img_path)
+
         if current_edit_id:
-            db_manager.update_post(current_edit_id, post_name, content, target_str, img_path)
+            db_manager.update_post(current_edit_id, post_name, content, target_str, final_img_url)
             status_lbl.configure(text=f"Success! Post {current_edit_id} updated.", text_color="green")
         else:
-            db_manager.add_post(post_name, content, target_str, img_path)
-            status_lbl.configure(text=f"Success! '{post_name}' queued for {target_str}", text_color="green")
+            db_manager.add_post(post_name, content, target_str, final_img_url)
+            status_lbl.configure(text=f"Success! '{post_name}' queued.", text_color="green")
 
         reset_form()
         refresh_queue_display()
-    except ValueError:
-        status_lbl.configure(text="Error: Invalid time format.", text_color="red")
 
+    except Exception as e:
+        status_lbl.configure(text=f"Error: {str(e)}", text_color="red")
 
 # --- UI Layout ---
 app = ctk.CTk()
-app.title("Aranse Dashboard")
+app.title("Àránṣẹ́")
 
 screen_width = app.winfo_screenwidth()
 screen_height = app.winfo_screenheight()

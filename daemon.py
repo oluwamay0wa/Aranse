@@ -1,279 +1,254 @@
-import asyncio
-import json
 import os
-import subprocess
+import sys
 import time
-
+import socket
+import signal
+import tempfile
+import logging
 from datetime import datetime
-
 import httpx
-import pystray
-from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
-from PIL import Image
-from plyer import notification
-
 import db_manager
 
-# 1. Resolve all absolute paths at the top
+# --- Environment & Logging Setup ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TOKEN_PATH = os.path.join(BASE_DIR, "linkedin_token.json")
-URN_PATH = os.path.join(BASE_DIR, "linkedin_urn.txt")
-ICON_PATH = os.path.join(BASE_DIR, "aranse_icon.png")
-ENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# 2. Load the .env file using the absolute path
-load_dotenv(ENV_PATH)
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+LINKEDIN_TOKEN = os.getenv("LINKEDIN_ACCESS_TOKEN")
+LINKEDIN_AUTHOR_URN = os.getenv("LINKEDIN_AUTHOR_URN")  # e.g., "urn:li:person:XXXXXX"
+MAX_RETRIES = 3
+POLL_INTERVAL_SECONDS = 30
 
-MAX_NETWORK_RETRIES = 30
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(os.path.join(BASE_DIR, "daemon.log"), encoding="utf-8")
+    ]
+)
 
-def load_credentials():
-    try:
-        # 3. Use the absolute paths here
-        with open(TOKEN_PATH, "r") as f:
-            token_data = json.load(f)
-            access_token = token_data.get("access_token")
-        with open(URN_PATH, "r") as f:
-            person_urn = f.read().strip()
-        return access_token, person_urn
-    except FileNotFoundError:
-        return None, None
+# --- Single Instance Lock ---
+class SingleInstanceLock:
+    """Ensures only one instance of the daemon runs simultaneously."""
+    def __init__(self, port: int = 47382):
+        self.port = port
+        self.sock = None
 
-def create_icon_image():
-    """Loads the custom Aranse icon from a local file using an absolute path."""
-    try:
-        # 4. Use the absolute path for the tray icon
-        return Image.open(ICON_PATH)
-    except FileNotFoundError:
-        return Image.new('RGB', (64, 64), color=(0, 0, 0))
-
-def verify_json_response(response):
-    """Checks if the Wi-Fi portal intercepted the request before parsing JSON."""
-    content_type = response.headers.get("Content-Type", "")
-
-    # If the response isn't JSON, we've been redirected to the CU login portal
-    if "application/json" not in content_type:
-        raise httpx.RequestError(f"Captive portal intercept detected. Content-Type: {content_type}")
-
-    try:
-        return response.json()
-    except json.JSONDecodeError:
-        raise httpx.RequestError("Invalid JSON received. Network likely intercepted.")
-
-def alert_user(title: str, message: str):
-    try:
-        notification.notify(title=title, message=message, app_name="LinkedIn Scheduler", timeout=10)
-    except Exception:
-        pass
-
-
-def refresh_access_token() -> bool:
-    """Exchanges the 365-day refresh token for a new 60-day access token."""
-    try:
-        with open(TOKEN_PATH, "r") as f:
-            token_data = json.load(f)
-
-        refresh_token = token_data.get("refresh_token")
-        if not refresh_token:
-            return False
-
-        url = "https://www.linkedin.com/oauth/v2/accessToken"
-        payload = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET
-        }
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-        response = httpx.post(url, data=payload)
-        if response.status_code == 200:
-            new_tokens = verify_json_response(response)
-            # Update the dictionary while preserving the original refresh token if a new one wasn't issued
-            token_data.update(new_tokens)
-            with open(TOKEN_PATH, "w") as f:
-                json.dump(token_data, f)
+    def acquire(self) -> bool:
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.bind(("127.0.0.1", self.port))
             return True
-        else:
-            print(f"Refresh failed: {response.text}")
+        except socket.error:
             return False
+
+    def release(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+
+# --- Network & Captive Portal Resilience ---
+def is_internet_available() -> bool:
+    """
+    Verifies actual internet connectivity by checking against a known endpoint
+    and detecting campus Wi-Fi (e.g. Covenant University) portal redirects.
+    """
+    try:
+        with httpx.Client(timeout=5.0, follow_redirects=False) as client:
+            response = client.get("https://www.linkedin.com")
+            # If redirected to CU portal (e.g. https://internetlogin.cu.edu.ng/portal?)
+            if response.status_code in (301, 302, 303, 307):
+                redirect_loc = response.headers.get("location", "")
+                if "internetlogin" in redirect_loc or "portal" in redirect_loc:
+                    logging.warning("Captive portal detected (Campus Wi-Fi login required). Waiting...")
+                    return False
+            return response.status_code < 500
     except Exception as e:
-        print(f"Error during token refresh: {e}")
+        logging.warning(f"Network connectivity check failed: {e}")
         return False
 
 
-async def upload_media_to_linkedin(media_path: str, access_token: str, person_urn: str) -> str:
-    if not os.path.exists(media_path):
-        raise FileNotFoundError(f"Media not found at {media_path}")
+# --- Cloud Media Handler ---
+def download_cloud_media(url: str) -> str:
+    """
+    Downloads a cloud asset (Supabase Storage URL) to a temporary local file.
+    Returns the file path.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return url
 
-    # Dynamically select the recipe based on the file extension
-    is_pdf = media_path.lower().endswith('.pdf')
-    recipe = "urn:li:digitalmediaRecipe:feedshare-document" if is_pdf else "urn:li:digitalmediaRecipe:feedshare-image"
+    ext = os.path.splitext(url.split("?")[0])[1] or ".jpg"
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
 
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        resp = client.get(url)
+        resp.raise_for_status()
+        temp_file.write(resp.content)
+        temp_file.close()
+
+    return temp_file.name
+
+
+# --- LinkedIn Publishing API ---
+def upload_image_asset(client: httpx.Client, headers: dict, file_path: str) -> str:
+    """
+    Executes the LinkedIn 3-step image asset registration & upload workflow.
+    Returns the image asset URN.
+    """
+    # Step 1: Register Upload
     register_url = "https://api.linkedin.com/v2/assets?action=registerUpload"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "X-RestLi-Protocol-Version": "2.0.0",
-        "Content-Type": "application/json"
-    }
-    register_payload = {
+    payload = {
         "registerUploadRequest": {
-            "recipes": [recipe],
-            "owner": person_urn,
-            "serviceRelationships": [{"relationshipType": "OWNER", "identifier": "urn:li:userGeneratedContent"}]
+            "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+            "owner": LINKEDIN_AUTHOR_URN,
+            "serviceRelationships": [
+                {
+                    "relationshipType": "OWNER",
+                    "identifier": "urn:li:userGeneratedContent"
+                }
+            ]
         }
     }
+    reg_resp = client.post(register_url, headers=headers, json=payload)
+    reg_resp.raise_for_status()
+    reg_data = reg_resp.json()
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        reg_response = await client.post(register_url, headers=headers, json=register_payload)
-        if reg_response.status_code == 401: return "ERROR_401"
-        if reg_response.status_code != 200: raise Exception(f"Registration failed: {reg_response.text}")
+    upload_url = reg_data["value"]["uploadMechanism"][
+        "com.linkedin.digitalmedia.uploading.VectorAssetUploadMechanism"
+    ]["uploadUrl"]
+    asset_urn = reg_data["value"]["asset"]
 
-        reg_data = verify_json_response(reg_response)
-        upload_url = reg_data["value"]["uploadMechanism"]["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"][
-            "uploadUrl"]
-        asset_urn = reg_data["value"]["asset"]
+    # Step 2: Upload Binary Bytes
+    with open(file_path, "rb") as f:
+        image_bytes = f.read()
 
-        with open(media_path, "rb") as media_file:
-            media_data = media_file.read()
+    upload_headers = {"Authorization": headers["Authorization"], "Content-Type": "application/octet-stream"}
+    upload_resp = client.put(upload_url, headers=upload_headers, content=image_bytes)
+    upload_resp.raise_for_status()
 
-        upload_headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/octet-stream"}
-        upload_response = await client.put(upload_url, headers=upload_headers, content=media_data)
-        if upload_response.status_code not in (200, 201): raise Exception(
-            f"Media upload failed: {upload_response.text}")
-
-        return asset_urn
+    return asset_urn
 
 
-async def publish_to_linkedin(content: str, media_path: str, access_token: str, person_urn: str) -> str:
-    asset_urn = None
-    media_category = "NONE"
+def publish_post_to_linkedin(content: str, media_url: str = None):
+    """Publishes text or image posts to LinkedIn via UGC Posts API."""
+    if not LINKEDIN_TOKEN or not LINKEDIN_AUTHOR_URN:
+        raise ValueError("LINKEDIN_ACCESS_TOKEN and LINKEDIN_AUTHOR_URN must be set in .env")
 
-    if media_path and media_path.strip():
-        asset_urn = await upload_media_to_linkedin(media_path, access_token, person_urn)
-        if asset_urn == "ERROR_401": return "ERROR_401"
-
-        # Set the correct UGC post category
-        media_category = "DOCUMENT" if media_path.lower().endswith('.pdf') else "IMAGE"
-
-    share_content = {"shareCommentary": {"text": content}, "shareMediaCategory": media_category}
-
-    if asset_urn:
-        # Use the actual filename as the document title (looks better in the LinkedIn feed)
-        file_title = os.path.basename(media_path)
-        share_content["media"] = [{
-            "status": "READY",
-            "description": {"text": "Scheduled via Custom UI"},
-            "media": asset_urn,
-            "title": {"text": file_title}
-        }]
-
-    payload = {
-        "author": person_urn, "lifecycleState": "PUBLISHED",
-        "specificContent": {"com.linkedin.ugc.ShareContent": share_content},
-        "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"}
+    headers = {
+        "Authorization": f"Bearer {LINKEDIN_TOKEN}",
+        "X-Restli-Protocol-Version": "2.0.0",
+        "Content-Type": "application/json"
     }
 
-    url = "https://api.linkedin.com/v2/ugcPosts"
-    headers = {"Authorization": f"Bearer {access_token}", "X-RestLi-Protocol-Version": "2.0.0",
-               "Content-Type": "application/json"}
+    local_temp_file = None
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            share_media_category = "NONE"
+            media_attachments = []
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, headers=headers, json=payload)
+            if media_url:
+                logging.info(f"Downloading cloud media: {media_url}")
+                local_temp_file = download_cloud_media(media_url)
+                asset_urn = upload_image_asset(client, headers, local_temp_file)
+                share_media_category = "IMAGE"
+                media_attachments = [{"status": "READY", "media": asset_urn}]
 
-    if response.status_code == 201:
-        return "SUCCESS"
-    elif response.status_code == 401:
-        return "ERROR_401"
-    elif response.status_code == 429:
-        return "ERROR_429"
-    else:
-        return f"ERROR_{response.status_code}"
+            post_body = {
+                "author": LINKEDIN_AUTHOR_URN,
+                "lifecycleState": "PUBLISHED",
+                "specificContent": {
+                    "com.linkedin.ugc.ShareContent": {
+                        "shareCommentary": {"text": content},
+                        "shareMediaCategory": share_media_category,
+                        "media": media_attachments
+                    }
+                },
+                "visibility": {
+                    "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+                }
+            }
 
-def check_and_publish():
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    pending_posts = db_manager.get_pending_posts(now_str)
-    if not pending_posts: return
+            post_url = "https://api.linkedin.com/v2/ugcPosts"
+            response = client.post(post_url, headers=headers, json=post_body)
+            response.raise_for_status()
+            logging.info("LinkedIn API accepted post payload.")
 
-    access_token, person_urn = load_credentials()
-    if not access_token or not person_urn:
-        alert_user("LinkedIn Scheduler Error", "Missing credentials. Run auth_server.py")
-        return
+    finally:
+        if local_temp_file and os.path.exists(local_temp_file):
+            os.remove(local_temp_file)
 
-    for post in pending_posts:
-        post_id, content, image_path, retry_count = post
-        print(f"\n[{now_str}] Executing post ID: {post_id}...")
 
-        try:
-            status = asyncio.run(publish_to_linkedin(content, image_path, access_token, person_urn))
+# --- Core Daemon Execution Loop ---
+class DaemonRunner:
+    def __init__(self):
+        self.running = True
+        signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIGTERM, self.shutdown)
 
-            if status == "SUCCESS":
+    def shutdown(self, signum, frame):
+        logging.info("Shutdown signal received. Exiting daemon safely...")
+        self.running = False
+
+    def process_queue(self):
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        pending_posts = db_manager.get_pending_posts(now_str)
+
+        if not pending_posts:
+            return
+
+        logging.info(f"Found {len(pending_posts)} post(s) due for publishing.")
+
+        for post in pending_posts:
+            post_id, content, media_url, retry_count = post
+
+            if retry_count >= MAX_RETRIES:
+                logging.error(f"Post {post_id} exceeded max retries. Marking as FAILED.")
+                db_manager.mark_failed(post_id, "FAILED_EXCEEDED_RETRIES")
+                continue
+
+            try:
+                logging.info(f"Executing Post ID: {post_id}...")
+                publish_post_to_linkedin(content, media_url)
                 db_manager.mark_published(post_id)
-                print(f"Post {post_id} published successfully.")
-            elif status == "ERROR_401":
-                print("Access token expired. Attempting automated refresh...")
-                if refresh_access_token():
-                    print("Token refreshed successfully! Post will execute on the next minute cycle.")
-                    # Notice we DO NOT mark it as failed here. It stays PENDING.
-                else:
-                    db_manager.mark_failed(post_id, "FAILED - EXPIRED TOKEN")
-                    alert_user("LinkedIn Token Expired", "Automated refresh failed. Please log in manually.")
-            elif status == "ERROR_429":
-                db_manager.mark_failed(post_id, "FAILED - RATE LIMIT")
-                alert_user("LinkedIn Rate Limit Hit", "You reached the 100 posts/day limit.")
-            else:
-                db_manager.mark_failed(post_id, f"FAILED - {status}")
+                logging.info(f"Post ID {post_id} successfully published and marked PUBLISHED.")
 
-        except httpx.RequestError:
-            new_attempts = retry_count + 1
-            if new_attempts <= MAX_NETWORK_RETRIES:
-                print(
-                    f"Network error on post {post_id} (Attempt {new_attempts}/{MAX_NETWORK_RETRIES}). Leaving as PENDING.")
+            except Exception as e:
+                logging.error(f"Error publishing Post ID {post_id}: {e}")
                 db_manager.increment_retry(post_id)
-            else:
-                db_manager.mark_failed(post_id, "FAILED - NETWORK TIMEOUT")
-                alert_user("Post Failed", f"Network unavailable for {MAX_NETWORK_RETRIES} minutes. Post cancelled.")
-        except Exception as e:
-            db_manager.mark_failed(post_id, "FAILED - SCRIPT ERROR")
 
+    def start(self):
+        logging.info("Aranse Background Daemon initialized.")
+        db_manager.init_db()
 
-def on_open_ui(icon, item):
-    """Launches the CustomTkinter UI dashboard."""
-    gui_path = os.path.join(BASE_DIR, "gui.py")
-    subprocess.Popen(["python", gui_path], shell=True)
+        while self.running:
+            try:
+                if is_internet_available():
+                    self.process_queue()
+                else:
+                    logging.info("Waiting for internet connection / portal auth...")
 
+            except Exception as e:
+                logging.critical(f"Unhandled exception in daemon loop: {e}", exc_info=True)
 
-def on_quit(icon, item):
-    """Safely shuts down the scheduler and removes the tray icon."""
-    print("Shutting down daemon...")
-    scheduler.shutdown(wait=False)
-    icon.stop()
+            # Sleep in small increments for rapid signal response on exit
+            for _ in range(POLL_INTERVAL_SECONDS):
+                if not self.running:
+                    break
+                time.sleep(1)
 
 
 if __name__ == "__main__":
-    print("Daemon started. Check your system tray for the Aranse icon.")
+    lock = SingleInstanceLock()
+    if not lock.acquire():
+        logging.warning("Another instance of Aranse daemon is already running. Exiting.")
+        sys.exit(0)
 
-    # Start the background scheduler — checks for pending posts every 60 seconds
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(check_and_publish, "interval", seconds=60)
-    scheduler.start()
-
-    # Build the system tray menu
-    menu = pystray.Menu(
-        pystray.MenuItem("Open UI Dashboard", on_open_ui),
-        pystray.MenuItem("Quit Scheduler", on_quit),
-    )
-
-    # Create and run the tray icon (this blocks and keeps the script alive)
     try:
-        tray_icon = pystray.Icon(
-            "LinkedInScheduler",
-            create_icon_image(),
-            "Àránṣẹ́ — LinkedIn Scheduler",
-            menu,
-        )
-        tray_icon.run()
+        runner = DaemonRunner()
+        runner.start()
     finally:
-        scheduler.shutdown(wait=False)
+        lock.release()

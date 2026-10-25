@@ -7,4 +7,8 @@ pystray
 Pillow
 python-dotenv
 fastapi
+psycopg2-binary
+httpx
+python-dotenv
+supabase
 uvicorn
