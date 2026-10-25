@@ -1,0 +1,10 @@
+customtkinter
+tkcalendar
+httpx
+apscheduler
+plyer
+pystray
+Pillow
+python-dotenv
+fastapi
+uvicorn

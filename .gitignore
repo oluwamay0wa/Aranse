@@ -1,0 +1,30 @@
+# Environment and credentials
+.env
+
+# LinkedIn OAuth tokens (regenerated via auth_server.py)
+linkedin_token.json
+linkedin_urn.txt
+
+# Local SQLite database
+scheduled_posts.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
